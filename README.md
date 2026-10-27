@@ -50,21 +50,21 @@ Sem pipeline de enriquecimento, sem enrich policy para reexecutar e sem dado dup
 ```mermaid
 flowchart LR
     subgraph EDR
-        API[API de inventário<br/>de endpoints]
+        API["API de inventário<br/>de endpoints"]
     end
     subgraph Elastic
-        WF[Elastic Workflow<br/>2x por dia]
-        LK[(edr_endpoints_lookup<br/>index.mode: lookup)]
-        NDR[(logs-ndr.detection-*)]
-        RULE[Regra ES|QL UC-07<br/>a cada 15 min]
-        HEALTH[Regra de saúde<br/>do inventário]
-        AL[Alerta]
+        WF["Elastic Workflow<br/>2x por dia"]
+        LK[("edr_endpoints_lookup<br/>index.mode: lookup")]
+        NDR[("logs-ndr.detection-*")]
+        RULE["Regra ES|QL UC-07<br/>a cada 15 min"]
+        HEALTH["Regra de saúde<br/>do inventário"]
+        AL["Alerta"]
     end
-    API -- paginação 100/pg --> WF
-    WF -- _bulk idempotente<br/>+ expurgo seguro --> LK
+    API -- "paginação 100/pg" --> WF
+    WF -- "_bulk idempotente<br/>+ expurgo seguro" --> LK
     NDR --> RULE
-    LK -- LOOKUP JOIN ON edr_ip --> RULE
-    RULE -- connected_agents == 0 --> AL
+    LK -- "LOOKUP JOIN ON edr_ip" --> RULE
+    RULE -- "connected_agents == 0" --> AL
     LK --> HEALTH
 ```
 
