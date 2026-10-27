@@ -1,0 +1,20 @@
+{
+  "settings": { "index.mode": "lookup" },
+  "mappings": {
+    "dynamic": false,
+    "properties": {
+      "edr_ip": { "type": "ip" },
+      "edr": {
+        "properties": {
+          "endpoint_id":     { "type": "keyword" },
+          "endpoint_name":   { "type": "keyword" },
+          "endpoint_status": { "type": "keyword" },
+          "group_name":      { "type": "keyword" },
+          "last_seen":       { "type": "date", "format": "epoch_millis" },
+          "inventory_date":  { "type": "date", "format": "epoch_second" },
+          "run_id":          { "type": "keyword" }
+        }
+      }
+    }
+  }
+}

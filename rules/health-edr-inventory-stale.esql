@@ -1,0 +1,7 @@
+// Saúde do inventário — dispara se o workflow parar ou o índice encolher.
+// Sem esta regra, um inventário vencido faz o UC-07 tratar endpoints novos como não gerenciados.
+// Tipo: ES|QL · Schedule: 1 h · Severidade: Medium · Notificar o time do SIEM, não o SOC.
+// Ajuste o piso de documentos ao tamanho do seu parque.
+FROM edr_endpoints_lookup
+| STATS last_inventory = MAX(edr.inventory_date), docs = COUNT(*)
+| WHERE last_inventory < NOW() - 36 hours OR docs < 10000

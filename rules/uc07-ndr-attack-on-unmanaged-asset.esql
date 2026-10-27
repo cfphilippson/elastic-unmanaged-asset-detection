@@ -1,0 +1,52 @@
+// UC-07 — NDR Attack on Unmanaged Asset
+// Tipo: ES|QL · Schedule: 15 min · Additional look-back: 1 h 45 min
+// Supressão: source.ip, 24 h · Severidade: High · Risk score: 73
+// Pré-requisito: índice edr_endpoints_lookup (index.mode: lookup) populado pelo workflow.
+FROM logs-ndr.detection-default
+| WHERE rule.category LIKE "Attack:*" AND rule.category != "Attack:Command and Control"
+  AND source.ip IS NOT NULL AND event.start >= NOW() - 2 hours
+// camada de comportamento: técnica derivada da detecção do NDR
+| EVAL mitre = CASE(
+    STARTS_WITH(rule.name, "PsExec"), "T1021.002 | T1569.002 | T1570",
+    LOCATE(rule.name, "WinRM") > 0, "T1021.006",
+    LOCATE(rule.name, "ADMIN$") > 0, "T1021.002",
+    STARTS_WITH(rule.name, "PE File Transfer"), "T1570 | T1021.002",
+    LOCATE(rule.name, "management ports") > 0, "T1021 | T1046",
+    STARTS_WITH(rule.name, "RDP High Bandwidth"), "T1048 | T1021.001",
+    LOCATE(rule.name, "FTP") > 0, "T1048.003",
+    LOCATE(rule.name, "VPS") > 0, "T1048",
+    STARTS_WITH(rule.name, "Active Directory Enumeration"), "T1087.002 | T1069.002 | T1482",
+    LOCATE(rule.name, "Nmap") > 0, "T1046",
+    rule.category == "Attack:Lateral Movement", "TA0008 (técnica não mapeada)",
+    rule.category == "Attack:Exfiltration", "TA0010 (técnica não mapeada)",
+    rule.category == "Attack:Discovery", "TA0007 (técnica não mapeada)",
+    "não mapeado")
+| STATS detections = COUNT_DISTINCT(detection.uuid), rules = VALUES(rule.name),
+        categories = VALUES(rule.category), mitre = VALUES(mitre),
+        ipam_host = VALUES(source.ipam.host_name),
+        ipam_group = VALUES(source.ipam.group_name)
+  BY source.ip
+// chave de junção com nome e tipo (ip) idênticos aos do índice lookup
+| EVAL edr_ip = source.ip
+| LOOKUP JOIN edr_endpoints_lookup ON edr_ip
+// um IP pode ter vários endpoints: basta um agente conectado para a origem ser gerenciada
+| EVAL is_connected = CASE(edr.endpoint_status == "CONNECTED", 1, 0)
+| STATS connected_agents = SUM(is_connected),
+        edr_hosts = VALUES(edr.endpoint_name),
+        edr_status = VALUES(edr.endpoint_status),
+        edr_last_seen = MAX(edr.last_seen),
+        inventory_date = MAX(edr.inventory_date),
+        detections = MAX(detections), rules = VALUES(rules),
+        categories = VALUES(categories), mitre = VALUES(mitre),
+        ipam_host = VALUES(ipam_host), ipam_group = VALUES(ipam_group)
+  BY source.ip
+| WHERE connected_agents == 0
+// camada de contexto: por que não há EDR
+| EVAL coverage_context = CASE(
+    edr_hosts IS NULL AND ipam_host IS NULL,
+      "Ativo desconhecido (sem EDR e sem IPAM): T1200 / T1564.006",
+    edr_hosts IS NULL,
+      "Ativo inventariado sem agente EDR: lacuna de cobertura",
+    "Agente existente sem conexão: verificar T1562.001")
+| KEEP source.ip, ipam_host, ipam_group, coverage_context, detections, categories,
+       mitre, rules, edr_hosts, edr_status, edr_last_seen, inventory_date

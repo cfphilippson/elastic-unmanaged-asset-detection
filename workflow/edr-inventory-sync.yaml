@@ -1,0 +1,243 @@
+version: "1"
+name: EDR endpoint inventory -> edr_endpoints_lookup
+description: >-
+  Sincroniza o inventário de endpoints do EDR no índice lookup edr_endpoints_lookup
+  (1 documento por IP + endpoint_id), usado pela regra UC-07 via LOOKUP JOIN ON edr_ip.
+  Cada execução grava edr.run_id (= execution.id). Documentos de outras execuções só
+  são expurgados se a coleta estiver completa, sem erro de bulk e com os documentos
+  da execução atual confirmados no índice.
+enabled: false
+tags: ["detection-engineering", "edr", "ndr", "uc-07", "lookup"]
+
+triggers:
+  - type: manual
+  - type: scheduled
+    with:
+      rrule:
+        freq: DAILY
+        interval: 1
+        tzid: America/Sao_Paulo
+        byhour: [5, 17]
+        byminute: [17]
+
+consts:
+  lookup_index: edr_endpoints_lookup
+  page_size: 100
+
+steps:
+  # 1. cria o índice lookup na primeira execução
+  - name: check_index
+    type: elasticsearch.search
+    with:
+      index: "{{ consts.lookup_index }}"
+      ignore_unavailable: true
+      size: 0
+
+  - name: create_if_missing
+    type: if
+    condition: "steps.check_index.output._shards.total : 0"
+    steps:
+      # PUT explícito via elasticsearch.request: na versão testada, o step tipado
+      # elasticsearch.indices.create aplicou o settings mas descartou o mapping,
+      # e o índice nasceu com dynamic mapping (chave de junção = text).
+      - name: create_index
+        type: elasticsearch.request
+        with:
+          method: PUT
+          path: "/{{ consts.lookup_index }}"
+          body:
+            settings:
+              index.mode: lookup
+            mappings:
+              dynamic: false
+              properties:
+                edr_ip:
+                  type: ip
+                edr:
+                  properties:
+                    endpoint_id:
+                      type: keyword
+                    endpoint_name:
+                      type: keyword
+                    endpoint_status:
+                      type: keyword
+                    group_name:
+                      type: keyword
+                    last_seen:
+                      type: date
+                      format: epoch_millis
+                    inventory_date:
+                      type: date
+                      format: epoch_second
+                    run_id:
+                      type: keyword
+
+  # verifica o tipo da chave de junção; se não for ip, não expurga nada
+  - name: get_mapping
+    type: elasticsearch.request
+    with:
+      method: GET
+      path: "/{{ consts.lookup_index }}/_mapping/field/edr_ip"
+
+  - name: mapping_guard
+    type: data.set
+    with:
+      # resposta: {"<index>":{"mappings":{"edr_ip":{"mapping":{"edr_ip":{"type":"ip"}}}}}}
+      join_key_type: "{% assign m = steps.get_mapping.output | json %}{% if m contains '\"type\":\"ip\"' %}ip{% else %}NOT-IP {{ m }}{% endif %}"
+
+  - name: log_bad_mapping
+    type: if
+    condition: "not variables.join_key_type : ip"
+    steps:
+      - name: log_mapping_error
+        type: console
+        with:
+          message: "ERRO: edr_ip mapeado como '{{ variables.join_key_type }}' (esperado ip). Recrie o índice com index/edr_endpoints_lookup.json. Expurgo não executado."
+
+  # garante edr.run_id em índices criados por versões anteriores (idempotente)
+  - name: ensure_mapping
+    type: elasticsearch.request
+    with:
+      method: PUT
+      path: "/{{ consts.lookup_index }}/_mapping"
+      body:
+        properties:
+          edr:
+            properties:
+              run_id:
+                type: keyword
+
+  # 2. estado da execução
+  - name: init
+    type: data.set
+    with:
+      run_ts: "{{ 'now' | date: '%s' }}"
+      run_id: "{{ execution.id }}"
+      offset: 0
+      fetched: 0
+      total: 0
+      has_more: "{% if variables.join_key_type == 'ip' %}true{% else %}false{% endif %}"
+      bulk_failed: false
+      bulk_error: ""
+
+  # 3. paginação da API de inventário do EDR
+  #    ADAPTAR: path, corpo da requisição e caminhos da resposta
+  #    (data.items / data.count / data.total e os campos de cada item) ao seu EDR.
+  - name: paginate
+    type: while
+    max-iterations: 300
+    condition: "variables.has_more : true"
+    steps:
+      - name: fetch_page
+        type: http
+        connector-id: EDR_HTTP_CONNECTOR_ID
+        timeout: "60s"
+        on-failure:
+          retry:
+            max-attempts: 3
+            delay: "30s"
+        with:
+          method: POST
+          path: /api/v1/endpoints/list
+          headers:
+            Content-Type: application/json
+          body:
+            offset: "${{ variables.offset | plus: 0 }}"
+            limit: "${{ consts.page_size | plus: 0 }}"
+            sort:
+              field: endpoint_id
+              order: ASC
+
+      - name: write_page
+        type: if
+        condition: "steps.fetch_page.output.data.count > 0"
+        steps:
+          - name: bulk_page
+            type: elasticsearch.request
+            on-failure:
+              retry:
+                max-attempts: 2
+                delay: "10s"
+            with:
+              method: POST
+              path: "/{{ consts.lookup_index }}/_bulk"
+              headers:
+                Content-Type: application/x-ndjson
+              # _id = ip_endpointid: idempotente entre execuções
+              body: |-
+                {%- for e in steps.fetch_page.output.data.items -%}{%- for addr in e.ip_addresses -%}
+                {"index":{"_id":"{{ addr }}_{{ e.endpoint_id }}"}}
+                {"edr_ip":"{{ addr }}","edr":{"endpoint_id":"{{ e.endpoint_id }}","endpoint_name":{{ e.hostname | json }},"endpoint_status":{{ e.status | json }},"group_name":{{ e.group | json }},"last_seen":{{ e.last_seen | default: "null" }},"inventory_date":{{ variables.run_ts }},"run_id":"{{ variables.run_id }}"}}
+                {% endfor -%}{%- endfor -%}
+
+          # _bulk responde HTTP 200 mesmo com itens rejeitados: checar errors
+          - name: check_bulk
+            type: if
+            condition: "steps.bulk_page.output.errors : true"
+            steps:
+              - name: flag_bulk_error
+                type: data.set
+                with:
+                  bulk_failed: true
+                  bulk_error: "{% for it in steps.bulk_page.output.items %}{% if it.index.error %}{{ it.index._id }} {{ it.index.error.type }}: {{ it.index.error.reason }}{% break %}{% endif %}{% endfor %}"
+              - name: log_bulk_error
+                type: console
+                with:
+                  message: "ERRO no _bulk (offset {{ variables.offset }}): {{ variables.bulk_error }}"
+
+      - name: advance
+        type: data.set
+        with:
+          offset: "${{ variables.offset | plus: consts.page_size }}"
+          fetched: "${{ variables.fetched | plus: steps.fetch_page.output.data.count }}"
+          total: "${{ steps.fetch_page.output.data.total | plus: 0 }}"
+          has_more: "{% if steps.fetch_page.output.data.count >= consts.page_size %}true{% else %}false{% endif %}"
+
+  # 4. só expurga se a coleta estiver completa E os docs desta execução estiverem no índice
+  - name: refresh_index
+    type: elasticsearch.request
+    with:
+      method: POST
+      path: "/{{ consts.lookup_index }}/_refresh"
+
+  - name: count_current
+    type: elasticsearch.search
+    with:
+      index: "{{ consts.lookup_index }}"
+      size: 0
+      track_total_hits: true
+      query:
+        term:
+          edr.run_id: "{{ variables.run_id }}"
+
+  - name: completeness
+    type: data.set
+    with:
+      current_docs: "${{ steps.count_current.output.hits.total.value | plus: 0 }}"
+      complete: "{% assign f = variables.fetched | plus: 0 %}{% assign t = variables.total | plus: 0 %}{% assign c = steps.count_current.output.hits.total.value | plus: 0 %}{% if f >= t and t > 0 and c > 0 and variables.bulk_failed != true and variables.join_key_type == 'ip' %}true{% else %}false{% endif %}"
+
+  - name: purge_or_keep
+    type: if
+    condition: "variables.complete : true"
+    steps:
+      - name: purge_stale
+        type: elasticsearch.request
+        with:
+          method: POST
+          # filtro na URL (q=), sem depender do body: apaga só docs de OUTRAS execuções
+          path: "/{{ consts.lookup_index }}/_delete_by_query?conflicts=proceed&refresh=true&q=NOT%20edr.run_id%3A%22{{ variables.run_id }}%22"
+      - name: count_after
+        type: elasticsearch.search
+        with:
+          index: "{{ consts.lookup_index }}"
+          size: 0
+          track_total_hits: true
+      - name: log_ok
+        type: console
+        with:
+          message: "EDR inventory OK: {{ variables.fetched }}/{{ variables.total }} endpoints; docs desta execução: {{ variables.current_docs }}; stale removidos: {{ steps.purge_stale.output.deleted }}; docs no índice após expurgo: {{ steps.count_after.output.hits.total.value }}"
+    else:
+      - name: log_incomplete
+        type: console
+        with:
+          message: "ATENÇÃO: coleta incompleta ({{ variables.fetched }}/{{ variables.total }}; docs desta execução={{ variables.current_docs }}; bulk_failed={{ variables.bulk_failed }}; {{ variables.bulk_error }}). Dados anteriores mantidos; nenhum expurgo executado."
