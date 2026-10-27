@@ -176,18 +176,18 @@ Janela de 7 dias, logo após a primeira carga do inventário (mais de 10 mil end
 |---|---|---|
 | Origem A: C2 de família de RAT conhecida | IOC de reputação compartilhada | Fora do UC-07 (categoria C2 excluída), coberto pelo UC de C2 |
 | Origem B: mesma família, mesmo padrão | IOC de reputação compartilhada | Idem |
-| **Origem C: servidor de produção** | **Verdadeiro positivo de cobertura** | Ver abaixo |
+| **Origem C** | **Verdadeiro positivo de cobertura** | Ver abaixo |
 
 **Origem C:**
 
 - **Contexto:** ativo inventariado no IPAM, ativo e enviando logs Windows ao SIEM, **sem nenhum registro no EDR** (nem por hostname, nem por IP).
 - **Comportamento:** WinRM inédito (TA0008 / T1021.006).
-- **Hipótese benigna:** remoting administrativo do serviço que roda no servidor.
+- **Hipótese benigna:** remoting administrativo legítimo.
 - **Complicador:** o enriquecimento de eventos do NDR falhou para essa detecção (timeout), então ela não trouxe destino.
 - **Como confirmar:** PowerShell Operational 4103/4104 no horário da detecção, logons 4624 tipo 3 nos destinos prováveis e sessões tcp/5985-5986 no firewall.
-- **Encaminhamento:** instalação do agente e revisão dos demais servidores da mesma função.
+- **Encaminhamento:** instalação do agente e revisão de ativos com o mesmo perfil.
 
-Benigno ou não, o achado justifica o caso de uso: um servidor de produção sem EDR só apareceu porque o NDR viu um comportamento e o inventário mostrou que não havia ninguém olhando para aquele host.
+Benigno ou não, o achado justifica o caso de uso: um ativo sem EDR só apareceu porque o NDR viu um comportamento e o inventário mostrou que não havia ninguém olhando para aquele host.
 
 Volume esperado após o ajuste: **cerca de 1 alerta por semana**.
 
